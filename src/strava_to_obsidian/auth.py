@@ -161,44 +161,72 @@ def ensure_valid_token(config: Config) -> bool:
     return True
 
 
-def authenticate(config: Config) -> Optional[TokenResponse]:
-    """Run the full OAuth authentication flow."""
+def authenticate(config: Config, manual: bool = False) -> Optional[TokenResponse]:
+    """Run the full OAuth authentication flow.
+    
+    Args:
+        config: Configuration with API credentials
+        manual: If True, prompt for manual code entry instead of local server
+    """
     if not config.has_valid_credentials():
         raise ValueError(
             "Missing Strava API credentials. Set STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET "
             "environment variables."
         )
 
-    # Reset any previous state
-    AuthCallbackHandler.authorization_code = None
-    AuthCallbackHandler.error = None
-
-    # Start local server to capture callback
-    server = http.server.HTTPServer(("localhost", REDIRECT_PORT), AuthCallbackHandler)
-    server_thread = threading.Thread(target=server.handle_request)
-    server_thread.start()
-
-    # Open browser for authorization
     auth_url = get_authorization_url(config.strava.client_id)
-    print(f"\nOpening browser for Strava authorization...")
-    print(f"If browser doesn't open, visit: {auth_url}\n")
-    webbrowser.open(auth_url)
+    
+    if manual:
+        # Manual flow for environments where localhost callback doesn't work
+        print(f"\n🔗 Open this URL in your browser:\n")
+        print(f"   {auth_url}\n")
+        print("After authorizing, you'll be redirected to a URL like:")
+        print("   http://localhost:8080/callback?code=XXXXX&scope=...")
+        print("\nThe page won't load, but copy the 'code' value from the URL.\n")
+        
+        code = input("Paste the authorization code here: ").strip()
+        
+        if not code:
+            raise ValueError("No authorization code provided.")
+        
+        # Handle if user pasted the full URL
+        if "code=" in code:
+            parsed = urllib.parse.urlparse(code)
+            params = urllib.parse.parse_qs(parsed.query)
+            code = params.get("code", [code])[0]
+    else:
+        # Automatic flow with local server
+        # Reset any previous state
+        AuthCallbackHandler.authorization_code = None
+        AuthCallbackHandler.error = None
 
-    # Wait for callback
-    server_thread.join(timeout=120)
-    server.server_close()
+        # Start local server to capture callback
+        server = http.server.HTTPServer(("localhost", REDIRECT_PORT), AuthCallbackHandler)
+        server_thread = threading.Thread(target=server.handle_request)
+        server_thread.start()
 
-    if AuthCallbackHandler.error:
-        raise ValueError(f"Authorization failed: {AuthCallbackHandler.error}")
+        # Open browser for authorization
+        print(f"\nOpening browser for Strava authorization...")
+        print(f"If browser doesn't open, visit: {auth_url}\n")
+        webbrowser.open(auth_url)
 
-    if not AuthCallbackHandler.authorization_code:
-        raise ValueError("Authorization timed out. Please try again.")
+        # Wait for callback
+        server_thread.join(timeout=120)
+        server.server_close()
+
+        if AuthCallbackHandler.error:
+            raise ValueError(f"Authorization failed: {AuthCallbackHandler.error}")
+
+        if not AuthCallbackHandler.authorization_code:
+            raise ValueError("Authorization timed out. Try 'strava-to-obsidian auth --manual'")
+
+        code = AuthCallbackHandler.authorization_code
 
     # Exchange code for tokens
     tokens = exchange_code_for_tokens(
         config.strava.client_id,
         config.strava.client_secret,
-        AuthCallbackHandler.authorization_code,
+        code,
     )
 
     # Save tokens

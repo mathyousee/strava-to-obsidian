@@ -24,24 +24,29 @@ def main(ctx: click.Context) -> None:
 
 
 @main.command()
+@click.option(
+    "--manual", "-m",
+    is_flag=True,
+    help="Manual mode: paste the authorization code instead of using local server",
+)
 @click.pass_context
-def auth(ctx: click.Context) -> None:
+def auth(ctx: click.Context, manual: bool) -> None:
     """Authenticate with Strava via OAuth."""
     config: Config = ctx.obj["config"]
 
     if not config.has_valid_credentials():
         click.echo("❌ Missing Strava API credentials.")
         click.echo("")
-        click.echo("Set these environment variables:")
-        click.echo("  export STRAVA_CLIENT_ID='your_client_id'")
-        click.echo("  export STRAVA_CLIENT_SECRET='your_client_secret'")
+        click.echo("Set these environment variables or create a .env file:")
+        click.echo("  STRAVA_CLIENT_ID='your_client_id'")
+        click.echo("  STRAVA_CLIENT_SECRET='your_client_secret'")
         click.echo("")
         click.echo("Get your credentials at: https://www.strava.com/settings/api")
         raise SystemExit(1)
 
     try:
         click.echo("🔐 Starting Strava authentication...")
-        tokens = authenticate(config)
+        tokens = authenticate(config, manual=manual)
         if tokens:
             click.echo(f"✅ Authenticated as {tokens.athlete_name} (ID: {tokens.athlete_id})")
             click.echo(f"   Tokens saved to {config.token_file}")
