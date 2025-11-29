@@ -137,4 +137,4 @@ Due to Strava API restrictions:
 
 ## License
 
-MIT
+MIT license
