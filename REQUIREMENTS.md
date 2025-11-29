@@ -1,1370 +1,580 @@
-# Software Requirements Document
-## Strava to Obsidian Activity Exporter
+# Software Requirements Document: Strava to Obsidian Exporter
 
-**Version:** 1.0  
-**Last Updated:** November 2025
-
----
-
-## Table of Contents
-
-1. [Introduction](#1-introduction)
-2. [Overall Description](#2-overall-description)
-3. [Strava API Integration](#3-strava-api-integration)
-4. [Data Model](#4-data-model)
-5. [File Structure and Organization](#5-file-structure-and-organization)
-6. [Obsidian Markdown Format](#6-obsidian-markdown-format)
-7. [Media Handling](#7-media-handling)
-8. [Configuration](#8-configuration)
-9. [Error Handling and Logging](#9-error-handling-and-logging)
-10. [Security Requirements](#10-security-requirements)
-11. [Technical Requirements](#11-technical-requirements)
-12. [Non-Functional Requirements](#12-non-functional-requirements)
-13. [Appendix](#13-appendix)
-
----
-
-## 1. Introduction
+## 1. Overview
 
 ### 1.1 Purpose
-
-This document specifies the software requirements for a Python script that exports Strava activities via the official Strava API and saves them as Obsidian-compatible Markdown files with associated media assets.
+A Python CLI tool that exports Strava activities via the official API and stores them as Obsidian-flavored Markdown files for personal archiving.
 
 ### 1.2 Scope
+- Export Strava activities to Markdown files with YAML frontmatter
+- Download associated media (photos, videos)
+- Support incremental sync for ongoing updates
+- Future: Generate static map images from GPS data
 
-The Strava to Obsidian Exporter will:
-- Authenticate with the Strava API using OAuth 2.0
-- Retrieve all user activities from Strava
-- Convert activity data to Obsidian-flavored Markdown files
-- Download and organize associated media (photos, videos, map images)
-- Support incremental updates to avoid re-downloading existing activities
-- Maintain a local archive that can be used with Obsidian or any Markdown-compatible tool
-
-### 1.3 Definitions and Acronyms
-
-| Term | Definition |
-|------|------------|
-| **Strava** | A social fitness tracking platform and application |
-| **Obsidian** | A knowledge management and note-taking application using Markdown files |
-| **API** | Application Programming Interface |
-| **OAuth 2.0** | Industry-standard authorization protocol |
-| **YAML** | YAML Ain't Markup Language - a human-readable data serialization format |
-| **Frontmatter** | YAML metadata block at the beginning of a Markdown file |
-| **Polyline** | An encoded representation of a route or path |
-
-### 1.4 References
-
-- [Strava API Documentation](https://developers.strava.com/docs/reference/)
-- [Strava API Authentication](https://developers.strava.com/docs/authentication/)
-- [Obsidian Markdown Reference](https://help.obsidian.md/Editing+and+formatting/Obsidian+Flavored+Markdown)
+### 1.3 Target Users
+- Primary: Personal use
+- Secondary: Public repository for others to use/adapt
 
 ---
 
-## 2. Overall Description
+## 2. Strava API Integration
 
-### 2.1 Product Perspective
+### 2.1 Authentication
+- **Method**: OAuth 2.0 Authorization Code flow
+- **Required Scopes**: `read`, `activity:read_all` (to include private activities)
+- **Redirect URI**: Local HTTP server on `http://localhost:8080/callback` for token capture
+- **Token Storage**: Local file (e.g., `.strava_tokens.json`) with restricted permissions (600)
+- **Token Refresh**: Automatic refresh when access token expires (tokens expire after 6 hours)
+- **Refresh Token Rotation**: Strava issues a new refresh token with each refresh; always store the latest
 
-This script serves as a bridge between Strava's cloud-based activity storage and a local Obsidian vault. It enables users to:
-- Create a permanent local backup of their fitness activities
-- Integrate activity data with personal knowledge management workflows
-- Link activities with other notes, journals, or documentation in Obsidian
-- Own their data in a portable, open format (Markdown)
+**OAuth Flow UX:**
+1. CLI starts local HTTP server on port 8080
+2. Browser opens Strava authorization URL
+3. User approves access (note: users may decline `activity:read_all`, limiting export to public activities)
+4. Strava redirects to localhost with authorization code
+5. CLI exchanges code for access + refresh tokens
+6. Tokens stored locally; server shuts down
 
-### 2.2 User Characteristics
+### 2.2 API Endpoints Required
+| Endpoint | Purpose |
+|----------|----------|
+| `GET /athlete` | Verify authentication, get athlete ID |
+| `GET /athlete/activities` | List activities (paginated, returns `SummaryActivity`) |
+| `GET /activities/{id}` | Get detailed activity data (returns `DetailedActivity`) |
+| `GET /activities/{id}/streams` | Get GPS/sensor data (future: maps) |
 
-The target user is someone who:
-- Has an active Strava account with recorded activities
-- Uses Obsidian for personal knowledge management
-- Has basic technical skills to run Python scripts
-- Wants to archive and integrate fitness data with other notes
+**Important: Two-Phase Fetch Required**
 
-### 2.3 Constraints
+The list endpoint (`/athlete/activities`) returns `SummaryActivity` objects which do **NOT** include:
+- `description`
+- `calories`
+- `average_heartrate` / `max_heartrate`
+- `photos`
 
-- Must comply with Strava's API Terms of Service and rate limits
-- Limited to data accessible through the authenticated user's Strava account
-- Dependent on Strava API availability
-- Photo/video downloads may be limited based on Strava subscription level
+To get these fields, you **must** call `GET /activities/{id}` for each activity. This means:
+- 30 activities = 1 list request + 30 detail requests = **31 API calls**
+- Plan accordingly for rate limits when doing bulk exports
 
-### 2.4 Assumptions
+### 2.3 Rate Limit Handling
+- **Limits**: 100 requests per 15 minutes, 1,000 requests per day
+- **Strategy**: 
+  - Track usage via response headers (`X-RateLimit-Limit`, `X-RateLimit-Usage`)
+  - Implement exponential backoff on 429 responses
+  - Log warnings when approaching limits
+  - Support resume/continue on rate limit exhaustion
 
-- User has Python 3.9+ installed
-- User has registered a Strava API application
-- User has write access to the target output directory
-- Internet connectivity is available during export
+**Bulk Export Implications:**
+| Time Range | Est. Activities | API Calls | Daily Limit Impact |
+|------------|-----------------|-----------|--------------------|
+| 30 days | ~30 | ~31 | 3% of daily limit |
+| 1 year | ~365 | ~367 | 37% of daily limit |
+| 5 years | ~1,825 | ~1,835 | **Exceeds daily limit** |
 
----
-
-## 3. Strava API Integration
-
-### 3.1 Authentication
-
-#### 3.1.1 OAuth 2.0 Flow
-
-The script SHALL implement the Strava OAuth 2.0 authorization flow:
-
-1. **Initial Authorization**
-   - Direct user to Strava authorization URL
-   - Request required scopes: `read`, `activity:read_all`
-   - Handle authorization callback with authorization code
-   - Exchange authorization code for access and refresh tokens
-
-2. **Token Management**
-   - Store tokens securely in a local configuration file
-   - Automatically refresh expired access tokens using the refresh token
-   - Handle token refresh failures gracefully
-
-#### 3.1.2 Required API Scopes
-
-| Scope | Purpose |
-|-------|---------|
-| `read` | Read public profile and public activities |
-| `activity:read_all` | Read all activities including private ones |
-| `read_all` | (Optional) Read all private data including zones |
-
-#### 3.1.3 Rate Limiting
-
-The script SHALL respect Strava API rate limits:
-- **15-minute limit:** 100 requests per 15 minutes
-- **Daily limit:** 1,000 requests per day
-
-Implementation requirements:
-- Track API request count
-- Implement exponential backoff on 429 (Rate Limit Exceeded) responses
-- Display rate limit status to user
-- Support resumable exports to handle rate limit interruptions
-
-### 3.2 API Endpoints
-
-The script SHALL use the following Strava API v3 endpoints:
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/athlete` | GET | Retrieve authenticated athlete profile |
-| `/athlete/activities` | GET | List all athlete activities (paginated) |
-| `/activities/{id}` | GET | Get detailed activity information |
-| `/activities/{id}/streams` | GET | Get activity stream data (GPS, heart rate, etc.) |
-| `/activities/{id}/photos` | GET | Get photos associated with activity |
-| `/activities/{id}/laps` | GET | Get lap data for activity |
-| `/routes/{id}` | GET | Get route details if activity follows a route |
-
-### 3.3 Pagination
-
-For list endpoints, the script SHALL:
-- Use pagination parameters (`page`, `per_page`)
-- Set `per_page` to maximum allowed value (200 for activities)
-- Continue fetching until all activities are retrieved
-- Support resumable pagination in case of interruption
+For large historical exports, implement:
+- Progress saving to resume across days
+- `--batch-size` option to limit activities per run
 
 ---
 
-## 4. Data Model
+## 3. Data Model
 
-### 4.1 Activity Data Fields
+### 3.1 Required Activity Fields
 
-The script SHALL extract and store the following activity data:
+| Field | Strava API Field | Type | Description |
+|-------|------------------|------|-------------|
+| ID | `id` | integer | Unique Strava activity identifier |
+| Start Date | `start_date_local` | datetime | Local start time of activity |
+| Name | `name` | string | User-defined activity title |
+| Description | `description` | string | User-defined description (nullable) |
+| Sport Type | `sport_type` | string | Strava sport type (e.g., "Run", "TrailRun", "GravelRide"). Note: Falls back to `type` field if `sport_type` unavailable |
+| Elapsed Time | `elapsed_time` | integer | Total time in seconds |
+| Moving Time | `moving_time` | integer | Active moving time in seconds |
+| Distance | `distance` | float | Distance in meters |
+| Max Heart Rate | `max_heartrate` | integer | Max HR in bpm (nullable) |
+| Average Heart Rate | `average_heartrate` | float | Avg HR in bpm (nullable) |
+| Max Speed | `max_speed` | float | Max speed in m/s (nullable) |
+| Average Speed | `average_speed` | float | Avg speed in m/s |
+| Elevation Gain | `total_elevation_gain` | float | Total elevation gain in meters |
+| Calories | `calories` | float | Estimated calories burned (nullable, often unavailable—requires power meter or specific wearables) |
+| Start Coordinates | `start_latlng` | [lat, lng] | Starting point coordinates (nullable) |
 
-#### 4.1.1 Core Activity Information
+### 3.2 Sport Type Icons
 
-| Field | Type | Description | Required |
-|-------|------|-------------|----------|
-| `id` | Integer | Unique Strava activity identifier | Yes |
-| `name` | String | User-defined activity name | Yes |
-| `type` | String | Activity type (Run, Ride, Swim, etc.) | Yes |
-| `sport_type` | String | Detailed sport type | Yes |
-| `start_date` | DateTime | Activity start time (UTC) | Yes |
-| `start_date_local` | DateTime | Activity start time (local timezone) | Yes |
-| `timezone` | String | Timezone of activity | Yes |
-| `description` | String | User-provided description | No |
-| `private` | Boolean | Whether activity is private | Yes |
-| `commute` | Boolean | Whether marked as commute | No |
-| `trainer` | Boolean | Whether performed on trainer | No |
-| `manual` | Boolean | Whether manually entered | No |
+Map Strava sport types to emoji icons for Obsidian display:
 
-#### 4.1.2 Performance Metrics
+| Sport Type | Icon | Sport Type | Icon |
+|------------|------|------------|------|
+| Run | 🏃 | Ride | 🚴 |
+| Swim | 🏊 | Walk | 🚶 |
+| Hike | 🥾 | Workout | 💪 |
+| WeightTraining | 🏋️ | Yoga | 🧘 |
+| CrossFit | 🏋️ | Elliptical | 🏃 |
+| StairStepper | 🪜 | Rowing | 🚣 |
+| Kayaking | 🛶 | Canoeing | 🛶 |
+| Skiing | ⛷️ | Snowboard | 🏂 |
+| IceSkate | ⛸️ | Golf | ⛳ |
+| Soccer | ⚽ | Tennis | 🎾 |
+| Pickleball | 🏓 | RockClimbing | 🧗 |
+| VirtualRun | 🏃‍♂️ | VirtualRide | 🚴‍♂️ |
+| EBikeRide | 🚲 | MountainBikeRide | 🚵 |
+| GravelRide | 🚴 | TrailRun | 🏃‍♂️ |
+| *Default* | 🏅 | | |
 
-| Field | Type | Unit | Description |
-|-------|------|------|-------------|
-| `distance` | Float | meters | Total distance |
-| `moving_time` | Integer | seconds | Time spent moving |
-| `elapsed_time` | Integer | seconds | Total elapsed time |
-| `total_elevation_gain` | Float | meters | Total elevation climbed |
-| `elev_high` | Float | meters | Highest elevation point |
-| `elev_low` | Float | meters | Lowest elevation point |
-| `average_speed` | Float | m/s | Average speed |
-| `max_speed` | Float | m/s | Maximum speed |
-| `average_cadence` | Float | rpm | Average cadence |
-| `average_heartrate` | Float | bpm | Average heart rate |
-| `max_heartrate` | Float | bpm | Maximum heart rate |
-| `average_watts` | Float | watts | Average power |
-| `max_watts` | Float | watts | Maximum power |
-| `weighted_average_watts` | Float | watts | Normalized power |
-| `kilojoules` | Float | kJ | Total energy output |
-| `calories` | Float | kcal | Estimated calories burned |
-| `suffer_score` | Integer | - | Strava Relative Effort score |
+### 3.3 Derived/Computed Fields
 
-#### 4.1.3 Location Data
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `start_latlng` | [Float, Float] | Starting coordinates [lat, lng] |
-| `end_latlng` | [Float, Float] | Ending coordinates [lat, lng] |
-| `map.summary_polyline` | String | Encoded polyline of route |
-| `map.polyline` | String | Detailed encoded polyline |
-
-#### 4.1.4 Equipment and Gear
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `gear_id` | String | Strava gear identifier |
-| `gear.name` | String | Name of gear used |
-| `gear.primary` | Boolean | Whether this is primary gear |
-| `gear.distance` | Float | Total distance on gear |
-
-#### 4.1.5 Segments and Achievements
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `segment_efforts` | Array | List of segment efforts |
-| `best_efforts` | Array | Personal records achieved |
-| `achievement_count` | Integer | Number of achievements |
-| `kudos_count` | Integer | Number of kudos received |
-| `comment_count` | Integer | Number of comments |
-| `pr_count` | Integer | Number of PRs achieved |
-
-#### 4.1.6 Lap Data
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `laps` | Array | Array of lap objects |
-| `lap.name` | String | Lap name |
-| `lap.elapsed_time` | Integer | Lap elapsed time |
-| `lap.moving_time` | Integer | Lap moving time |
-| `lap.distance` | Float | Lap distance |
-| `lap.average_speed` | Float | Lap average speed |
-| `lap.average_heartrate` | Float | Lap average heart rate |
-
-### 4.2 Athlete Data
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | Integer | Athlete ID |
-| `firstname` | String | First name |
-| `lastname` | String | Last name |
-| `profile` | String | Profile photo URL |
-| `measurement_preference` | String | "feet" or "meters" |
+| Field | Computation | Unit in Output |
+|-------|-------------|----------------|
+| `distance_km` | `distance / 1000` | kilometers |
+| `distance_mi` | `distance / 1609.344` | miles |
+| `elapsed_time_fmt` | Format as `HH:MM:SS` | string |
+| `moving_time_fmt` | Format as `HH:MM:SS` | string |
+| `pace_min_km` | `moving_time / 60 / distance_km` | min/km |
+| `pace_min_mi` | `moving_time / 60 / distance_mi` | min/mi |
+| `speed_kph` | `average_speed * 3.6` | km/h |
+| `speed_mph` | `average_speed * 2.237` | mph |
+| `elevation_gain_ft` | `total_elevation_gain * 3.281` | feet |
 
 ---
 
-## 5. File Structure and Organization
+## 4. File Structure
 
-### 5.1 Directory Structure
-
-The script SHALL create the following directory structure:
-
+### 4.1 Directory Layout
 ```
-<output_directory>/
-├── .strava-export/
-│   ├── config.json          # Configuration and tokens
-│   ├── state.json            # Export state and last sync
-│   └── activity_index.json   # Index of exported activities
-├── media/
-│   ├── maps/
-│   │   └── <activity_id>_map.png
-│   ├── photos/
-│   │   └── <activity_id>/
-│   │       ├── photo_001.jpg
-│   │       └── photo_002.jpg
-│   └── videos/
-│       └── <activity_id>/
-│           └── video_001.mp4
+<obsidian-vault>/
 └── activities/
-    ├── 2024/
-    │   ├── 2024-01/
-    │   │   ├── 2024-01-15_Morning_Run.md
-    │   │   └── 2024-01-16_Evening_Ride.md
-    │   └── 2024-02/
-    │       └── 2024-02-01_Long_Run.md
-    └── 2025/
-        └── 2025-01/
-            └── 2025-01-05_New_Year_Ride.md
+    ├── 2025-11-29-morning-run.md
+    ├── 2025-11-28-evening-ride.md
+    ├── ...
+    └── media/
+        ├── 12345678901_photo_1.jpg
+        ├── 12345678901_photo_2.jpg
+        └── ...
 ```
 
-### 5.2 File Naming Conventions
-
-#### 5.2.1 Activity Files
-
-Activity Markdown files SHALL be named using the pattern:
+### 4.2 File Naming Convention
 ```
-YYYY-MM-DD_<sanitized_activity_name>.md
+YYYY-MM-DD-<slugified-activity-name>.md
 ```
 
-Sanitization rules:
-- Replace spaces with underscores
-- Remove or replace special characters: `/ \ : * ? " < > |`
-- Truncate to maximum 100 characters (before extension)
-- Append numeric suffix if duplicate: `_2`, `_3`, etc.
+**Slugification Rules:**
+- Convert to lowercase
+- Replace spaces with hyphens
+- Remove special characters (keep alphanumeric and hyphens)
+- Truncate to 50 characters max (before extension)
+- Append activity ID if duplicate filename exists: `2025-11-29-morning-run-12345678901.md`
 
-#### 5.2.2 Media Files
+**Examples:**
+| Activity Name | Date | Filename |
+|---------------|------|----------|
+| "Morning Run" | 2025-11-29 | `2025-11-29-morning-run.md` |
+| "🏃 5K Race!!!" | 2025-11-28 | `2025-11-28-5k-race.md` |
+| "Lunch Run" (duplicate) | 2025-11-29 | `2025-11-29-lunch-run-12345678901.md` |
 
-**Map Images:**
+### 4.3 Media Naming Convention
 ```
-<activity_id>_map.png
-```
-
-**Photos:**
-```
-<activity_id>/<sequential_number>_<original_filename>
-```
-
-**Videos:**
-```
-<activity_id>/<sequential_number>_<original_filename>
+<activity-id>_<media-type>_<index>.<extension>
 ```
 
-### 5.3 Index and State Files
-
-#### 5.3.1 Activity Index (`activity_index.json`)
-
-```json
-{
-  "version": "1.0",
-  "last_updated": "2025-01-15T10:30:00Z",
-  "activities": [
-    {
-      "strava_id": 12345678901,
-      "file_path": "activities/2024/2024-01/2024-01-15_Morning_Run.md",
-      "media_files": [
-        "media/maps/12345678901_map.png",
-        "media/photos/12345678901/001_photo.jpg"
-      ],
-      "exported_at": "2025-01-15T10:25:00Z",
-      "strava_updated_at": "2024-01-15T08:00:00Z"
-    }
-  ]
-}
-```
-
-#### 5.3.2 Export State (`state.json`)
-
-```json
-{
-  "version": "1.0",
-  "last_full_sync": "2025-01-15T10:30:00Z",
-  "last_activity_date": "2025-01-14T07:30:00Z",
-  "total_activities_exported": 523,
-  "total_media_files": 1247,
-  "sync_status": "completed"
-}
-```
+**Examples:**
+- `12345678901_photo.jpg` (primary photo only—API limitation)
+- `12345678901_map.png` (future)
 
 ---
 
-## 6. Obsidian Markdown Format
+## 5. Obsidian Markdown Format
 
-### 6.1 Frontmatter Structure
-
-Each activity Markdown file SHALL include YAML frontmatter with the following structure:
-
-```yaml
----
-# Core Identification
-strava_id: 12345678901
-strava_url: "https://www.strava.com/activities/12345678901"
-title: "Morning Run"
-date: 2024-01-15
-datetime: 2024-01-15T07:30:00-05:00
-timezone: "America/New_York"
-
-# Activity Classification
-type: Run
-sport_type: Run
-activity_type: run
-is_race: false
-is_commute: false
-is_trainer: false
-is_manual: false
-is_private: false
-
-# Performance Metrics
-distance_km: 10.5
-distance_mi: 6.52
-duration_minutes: 52
-duration_formatted: "52:30"
-moving_time_minutes: 50
-moving_time_formatted: "50:15"
-pace_per_km: "5:00"
-pace_per_mi: "8:03"
-speed_kmh: 12.0
-speed_mph: 7.46
-elevation_gain_m: 125
-elevation_gain_ft: 410
-calories: 650
-
-# Heart Rate (if available)
-avg_heartrate: 152
-max_heartrate: 175
-
-# Power Data (if available)
-avg_watts: null
-max_watts: null
-weighted_avg_watts: null
-
-# Cadence (if available)
-avg_cadence: 180
-
-# Location
-start_location: [40.7128, -74.0060]
-end_location: [40.7580, -73.9855]
-city: "New York"
-state: "New York"
-country: "United States"
-
-# Gear
-gear: "Nike Pegasus 40"
-gear_id: "g12345678"
-
-# Social
-kudos: 15
-comments: 3
-achievements: 2
-pr_count: 1
-
-# Strava Scores
-suffer_score: 85
-relative_effort: 85
-
-# Media
-has_photos: true
-photo_count: 2
-has_map: true
-
-# Tags for Obsidian
-tags:
-  - strava
-  - run
-  - morning-run
-  - 2024
-  - january
-
-# Aliases for Obsidian linking
-aliases:
-  - "Morning Run 2024-01-15"
-  - "Run 10.5km"
-
-# Custom fields
-weather: null
-notes: null
----
-```
-
-### 6.2 Markdown Body Structure
-
-The body of each activity file SHALL follow this template:
+### 5.1 File Template
 
 ```markdown
-# Morning Run
+---
+strava_id: 12345678901
+date: 2025-11-29T07:30:00
+name: "Morning Run"
+sport_type: Run
+icon: 🏃
+description: "Easy recovery run around the neighborhood"
+elapsed_time: 1845
+elapsed_time_fmt: "00:30:45"
+moving_time: 1800
+moving_time_fmt: "00:30:00"
+distance_m: 5000
+distance_km: 5.0
+distance_mi: 3.11
+average_speed_ms: 2.78
+speed_kph: 10.0
+speed_mph: 6.21
+pace_min_km: 6.0
+pace_min_mi: 9.66
+max_speed_ms: 3.5
+elevation_gain_m: 45
+elevation_gain_ft: 147.6
+average_heartrate: 145
+max_heartrate: 165
+calories: 320
+coordinates:
+    - 47.6062
+    - -122.3321
+photo: "[[media/12345678901_photo.jpg]]"
+tags:
+  - activity
+  - run
+---
 
-> 🏃 **Run** on **Monday, January 15, 2024** at **7:30 AM**
+# 🏃 Morning Run
+
+**Date:** Saturday, November 29, 2025 at 7:30 AM
 
 ## Summary
 
 | Metric | Value |
 |--------|-------|
-| 📏 Distance | 10.5 km (6.52 mi) |
-| ⏱️ Duration | 52:30 |
-| 🏃 Moving Time | 50:15 |
-| ⚡ Pace | 5:00 /km (8:03 /mi) |
-| ⛰️ Elevation | +125 m (+410 ft) |
-| 🔥 Calories | 650 kcal |
-| ❤️ Avg HR | 152 bpm |
-| 💪 Relative Effort | 85 |
+| Distance | 5.0 km (3.11 mi) |
+| Duration | 00:30:00 moving / 00:30:45 elapsed |
+| Pace | 6:00 /km (9:40 /mi) |
+| Elevation | ↑ 45 m (148 ft) |
+| Calories | 320 kcal |
+| Heart Rate | 145 avg / 165 max bpm |
 
 ## Description
 
-User's activity description appears here if provided.
+Easy recovery run around the neighborhood
 
-## Route Map
+## Photo
 
-![[media/maps/12345678901_map.png]]
+![[media/12345678901_photo.jpg]]
 
-## Photos
-
-![[media/photos/12345678901/001_photo.jpg]]
-![[media/photos/12345678901/002_photo.jpg]]
-
-## Laps
-
-| Lap | Distance | Time | Pace | Avg HR |
-|-----|----------|------|------|--------|
-| 1 | 1.0 km | 5:05 | 5:05 /km | 145 |
-| 2 | 1.0 km | 4:58 | 4:58 /km | 150 |
-| 3 | 1.0 km | 4:55 | 4:55 /km | 154 |
-| ... | ... | ... | ... | ... |
-
-## Segments
-
-### Segment Name 1
-- **Time:** 2:45
-- **Rank:** 15 / 1,234 (Top 1.2%)
-- **PR:** Yes ⭐
-
-### Segment Name 2
-- **Time:** 1:30
-- **Rank:** 234 / 5,678
-
-## Best Efforts
-
-| Effort | Time | Date |
-|--------|------|------|
-| 1 km | 4:32 | PR! |
-| 1 mile | 7:25 | - |
-| 5 km | 24:15 | - |
-
-## Achievements
-
-- 🏆 New 1 km PR: 4:32
-- 🥈 2nd fastest 5 km this year
-
-## Gear
-
-**Nike Pegasus 40** (Total: 523.4 km)
-
-## Raw Data
-
-<details>
-<summary>View raw Strava data</summary>
-
-```json
-{
-  "id": 12345678901,
-  "name": "Morning Run",
-  ...
-}
+---
+*Exported from Strava activity [12345678901](https://www.strava.com/activities/12345678901)*
 ```
 
-</details>
+### 5.2 YAML Frontmatter Fields
+
+**Always Present:**
+- `strava_id`, `date`, `name`, `sport_type`, `icon`
+- `elapsed_time`, `elapsed_time_fmt`, `moving_time`, `moving_time_fmt`
+- `distance_m`, `distance_km`, `distance_mi`
+- `average_speed_ms`, `speed_kph`, `speed_mph`
+- `tags`
+
+**Present When Available:**
+- `description` (if not empty)
+- `max_speed_ms` (if recorded)
+- `elevation_gain_m`, `elevation_gain_ft` (if > 0)
+- `average_heartrate`, `max_heartrate` (if HR data exists)
+- `calories` (if recorded)
+- `start_lat`, `start_lng` (if GPS data exists)
+- `pace_min_km`, `pace_min_mi` (for run/walk activities)
+- `photo` (if primary photo exists)
+
+### 5.3 Tags
+Auto-generated tags:
+- `activity` (always)
+- `<sport-type-lowercase>` (e.g., `run`, `ride`, `swim`)
 
 ---
 
-*Exported from Strava on 2025-01-15 | [View on Strava](https://www.strava.com/activities/12345678901)*
-```
+## 6. Media Handling
 
-### 6.3 Activity Type Icons
+### 6.1 Photos
 
-The script SHALL use appropriate icons for different activity types:
+⚠️ **API Limitation:** Strava's API provides very limited photo access. There is no dedicated photos endpoint.
 
-| Activity Type | Icon |
-|---------------|------|
-| Run | 🏃 |
-| Ride | 🚴 |
-| Swim | 🏊 |
-| Walk | 🚶 |
-| Hike | 🥾 |
-| Alpine Ski | ⛷️ |
-| Nordic Ski | 🎿 |
-| Snowboard | 🏂 |
-| Weight Training | 🏋️ |
-| Yoga | 🧘 |
-| Workout | 💪 |
-| Rock Climbing | 🧗 |
-| Rowing | 🚣 |
-| Kayaking | 🛶 |
-| Golf | ⛳ |
-| Soccer | ⚽ |
-| Tennis | 🎾 |
-| Other | 🏅 |
+**What's Available:**
+- **Source**: `DetailedActivity.photos.primary.urls` object in activity detail response
+- **Access**: Only the **primary photo** (activity cover photo) is accessible
+- **Sizes**: Limited to specific sizes (`100`, `600` pixels) — no original resolution
+- **Multiple Photos**: If an activity has multiple photos, only the primary is available via API
 
-### 6.4 Unit Formatting
+**Implementation:**
+- Check `activity.photos.count` to see if photos exist
+- If `photos.primary` exists, download from `photos.primary.urls["600"]`
+- Storage: `/activities/media/<activity-id>_photo.jpg`
+- Reference: Obsidian wikilink format `![[media/filename.jpg]]`
 
-The script SHALL support both metric and imperial units:
+### 6.2 Videos
 
-#### 6.4.1 Distance
-- Display both km and miles in summary
-- Use user's Strava preference as primary
+❌ **Not Available:** The Strava API does **not** provide access to activity videos. This is a platform limitation with no workaround.
 
-#### 6.4.2 Pace/Speed
-- Running activities: pace (min/km or min/mi)
-- Cycling activities: speed (km/h or mph)
+### 6.3 Maps (Future/MVP+)
+- **Source**: `DetailedActivity.map.summary_polyline` (encoded polyline string)
+- **Decoding**: Use `polyline` library to decode to lat/lng coordinates
+- **Generation**: Static image via Mapbox Static API, Google Static Maps, or OpenStreetMap
+- **Storage**: `/activities/media/<activity-id>_map.png`
+- **Config Options**: 
+  - Map style (streets, satellite, dark)
+  - Image dimensions
+  - Route color
 
-#### 6.4.3 Elevation
-- Display both meters and feet
-
-#### 6.4.4 Time Formatting
-- Duration: `HH:MM:SS` or `MM:SS` for activities under 1 hour
-- Pace: `M:SS` format
+**Note:** The `summary_polyline` is included in the `DetailedActivity` response, so no additional API calls needed for map data.
 
 ---
 
-## 7. Media Handling
+## 7. Sync Behavior
 
-### 7.1 Map Generation
+### 7.1 Initial Sync
+- **Default**: Export activities from the last 30 days
+- **Option**: Specify custom date range via CLI flags
+- **Pagination**: Handle Strava's 200 activities per page limit
 
-#### 7.1.1 Map Image Requirements
+**Note:** The `after` and `before` API parameters require **epoch timestamps** (seconds since 1970-01-01), not ISO date strings. The CLI accepts human-readable dates and converts internally.
 
-The script SHALL generate static map images for activities with GPS data:
+### 7.2 Incremental Sync
+- **Tracking**: Store last sync timestamp in `.strava_sync_state.json`
+- **Detection**: Use `after` parameter to fetch only new activities
+- **Updates**: Re-export if activity `updated_at` > file modification time (optional flag)
 
-- **Image Format:** PNG
-- **Resolution:** 800 x 600 pixels (configurable)
-- **Style:** Clean, readable with route overlay
-- **Route Color:** Activity type-specific (configurable)
-- **Background:** Street map or satellite (configurable)
-
-#### 7.1.2 Map Generation Options
-
-**Option 1: Mapbox Static Images API**
-```
-https://api.mapbox.com/styles/v1/mapbox/streets-v11/static/
-  path-{strokeWidth}+{strokeColor}({encodedPolyline})/
-  auto/{width}x{height}?access_token={token}
-```
-
-**Option 2: OpenStreetMap with Folium**
-- Generate maps locally using Python Folium library
-- Export as PNG using browser automation
-
-**Option 3: Google Static Maps API**
-```
-https://maps.googleapis.com/maps/api/staticmap?
-  size={width}x{height}&
-  path=enc:{encodedPolyline}&
-  key={api_key}
-```
-
-#### 7.1.3 Polyline Decoding
-
-The script SHALL:
-- Decode Strava's encoded polyline format
-- Support both summary and detailed polylines
-- Handle activities without GPS data gracefully
-
-### 7.2 Photo Handling
-
-#### 7.2.1 Photo Download
-
-The script SHALL download activity photos:
-- Download full-resolution photos when available
-- Fall back to largest available size
-- Preserve original file format (JPEG, PNG)
-- Include photo metadata (EXIF) when available
-
-#### 7.2.2 Photo Sources
-
-| Source | Access | Notes |
-|--------|--------|-------|
-| Primary photos | API `/activities/{id}/photos` | Direct Strava photos |
-| Instagram photos | May be linked | Requires additional handling |
-
-#### 7.2.3 Photo Metadata
-
-Store photo metadata for each image:
+### 7.3 State File Format
 ```json
 {
-  "photo_id": "12345",
-  "activity_id": 12345678901,
-  "caption": "Beautiful sunrise",
-  "location": [40.7128, -74.0060],
-  "taken_at": "2024-01-15T07:45:00Z",
-  "urls": {
-    "100": "https://...",
-    "600": "https://...",
-    "2048": "https://..."
-  },
-  "local_path": "media/photos/12345678901/001_sunrise.jpg"
-}
-```
-
-### 7.3 Video Handling
-
-#### 7.3.1 Video Download
-
-The script SHALL attempt to download activity videos:
-- Check for video attachments in activity
-- Download highest quality available
-- Store in activity-specific subfolder
-
-#### 7.3.2 Video Limitations
-
-Note: Strava's API has limited video support. The script SHALL:
-- Document known limitations
-- Handle missing video gracefully
-- Log when videos cannot be downloaded
-
-### 7.4 Media Storage Optimization
-
-#### 7.4.1 Deduplication
-
-- Check if media file already exists before downloading
-- Use file hash (MD5/SHA256) for duplicate detection
-- Skip download if identical file exists
-
-#### 7.4.2 Progressive Download
-
-- Support resumable downloads for large files
-- Implement retry logic for failed downloads
-- Track download progress for large media sets
-
----
-
-## 8. Configuration
-
-### 8.1 Configuration File
-
-The script SHALL use a JSON configuration file:
-
-#### 8.1.1 Configuration File Location
-
-Default locations (in order of precedence):
-1. `--config` command line argument
-2. `./strava-export-config.json`
-3. `~/.config/strava-to-obsidian/config.json`
-
-#### 8.1.2 Configuration Schema
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
-  "properties": {
-    "strava": {
-      "type": "object",
-      "properties": {
-        "client_id": {
-          "type": "string",
-          "description": "Strava API application client ID"
-        },
-        "client_secret": {
-          "type": "string",
-          "description": "Strava API application client secret"
-        },
-        "access_token": {
-          "type": "string",
-          "description": "Current access token (auto-managed)"
-        },
-        "refresh_token": {
-          "type": "string",
-          "description": "Refresh token for token renewal"
-        },
-        "token_expires_at": {
-          "type": "integer",
-          "description": "Token expiration timestamp"
-        }
-      },
-      "required": ["client_id", "client_secret"]
-    },
-    "output": {
-      "type": "object",
-      "properties": {
-        "base_directory": {
-          "type": "string",
-          "description": "Root directory for exported files",
-          "default": "./strava-export"
-        },
-        "activities_folder": {
-          "type": "string",
-          "description": "Subdirectory for activity files",
-          "default": "activities"
-        },
-        "media_folder": {
-          "type": "string",
-          "description": "Subdirectory for media files",
-          "default": "media"
-        },
-        "organize_by_year": {
-          "type": "boolean",
-          "description": "Create year/month subdirectories",
-          "default": true
-        },
-        "organize_by_month": {
-          "type": "boolean",
-          "description": "Create month subdirectories within years",
-          "default": true
-        }
-      }
-    },
-    "export": {
-      "type": "object",
-      "properties": {
-        "include_private": {
-          "type": "boolean",
-          "description": "Export private activities",
-          "default": true
-        },
-        "include_manual": {
-          "type": "boolean",
-          "description": "Export manually entered activities",
-          "default": true
-        },
-        "activity_types": {
-          "type": "array",
-          "items": {"type": "string"},
-          "description": "Activity types to export (empty = all)",
-          "default": []
-        },
-        "date_range": {
-          "type": "object",
-          "properties": {
-            "after": {
-              "type": "string",
-              "format": "date",
-              "description": "Only export activities after this date"
-            },
-            "before": {
-              "type": "string",
-              "format": "date",
-              "description": "Only export activities before this date"
-            }
-          }
-        },
-        "include_raw_data": {
-          "type": "boolean",
-          "description": "Include raw JSON in markdown",
-          "default": true
-        }
-      }
-    },
-    "media": {
-      "type": "object",
-      "properties": {
-        "download_photos": {
-          "type": "boolean",
-          "description": "Download activity photos",
-          "default": true
-        },
-        "download_videos": {
-          "type": "boolean",
-          "description": "Download activity videos",
-          "default": true
-        },
-        "generate_maps": {
-          "type": "boolean",
-          "description": "Generate map images",
-          "default": true
-        },
-        "map_provider": {
-          "type": "string",
-          "enum": ["mapbox", "osm", "google"],
-          "description": "Map tile provider",
-          "default": "osm"
-        },
-        "map_style": {
-          "type": "string",
-          "description": "Map style identifier",
-          "default": "streets"
-        },
-        "map_width": {
-          "type": "integer",
-          "description": "Map image width in pixels",
-          "default": 800
-        },
-        "map_height": {
-          "type": "integer",
-          "description": "Map image height in pixels",
-          "default": 600
-        },
-        "photo_size": {
-          "type": "string",
-          "enum": ["original", "large", "medium", "thumbnail"],
-          "description": "Photo size to download",
-          "default": "large"
-        }
-      }
-    },
-    "formatting": {
-      "type": "object",
-      "properties": {
-        "units": {
-          "type": "string",
-          "enum": ["metric", "imperial", "both"],
-          "description": "Unit system for display",
-          "default": "both"
-        },
-        "date_format": {
-          "type": "string",
-          "description": "Date format string",
-          "default": "%Y-%m-%d"
-        },
-        "time_format": {
-          "type": "string",
-          "description": "Time format string",
-          "default": "%H:%M"
-        },
-        "include_tags": {
-          "type": "boolean",
-          "description": "Add Obsidian tags to frontmatter",
-          "default": true
-        },
-        "custom_tags": {
-          "type": "array",
-          "items": {"type": "string"},
-          "description": "Additional tags to add to all activities",
-          "default": ["strava"]
-        }
-      }
-    },
-    "sync": {
-      "type": "object",
-      "properties": {
-        "mode": {
-          "type": "string",
-          "enum": ["full", "incremental", "update"],
-          "description": "Sync mode",
-          "default": "incremental"
-        },
-        "update_existing": {
-          "type": "boolean",
-          "description": "Update existing activity files",
-          "default": false
-        },
-        "delete_removed": {
-          "type": "boolean",
-          "description": "Delete files for removed activities",
-          "default": false
-        }
-      }
-    },
-    "api_keys": {
-      "type": "object",
-      "properties": {
-        "mapbox_token": {
-          "type": "string",
-          "description": "Mapbox API token (if using Mapbox maps)"
-        },
-        "google_maps_key": {
-          "type": "string",
-          "description": "Google Maps API key (if using Google maps)"
-        }
-      }
+  "last_sync": "2025-11-29T12:00:00Z",
+  "exported_activities": {
+    "12345678901": {
+      "filename": "2025-11-29-morning-run.md",
+      "updated_at": "2025-11-29T08:00:00Z"
     }
   }
 }
 ```
 
-### 8.2 Command Line Interface
+### 7.4 Conflict Handling
+- **Default**: Skip existing files (preserve manual edits)
+- **Option**: `--force` flag to overwrite all files
+- **Option**: `--update-frontmatter` to update YAML only, preserve body edits
 
-The script SHALL support the following command line arguments:
+---
+
+## 8. Configuration
+
+### 8.1 Config File
+Location: `~/.config/strava-to-obsidian/config.yaml` or project root `.strava-export.yaml`
+
+```yaml
+# Strava API credentials
+strava:
+  client_id: "YOUR_CLIENT_ID"
+  client_secret: "YOUR_CLIENT_SECRET"
+
+# Export settings
+export:
+  output_dir: "/path/to/obsidian/vault/activities"
+  date_format: "%Y-%m-%d"
+  
+# Unit preferences
+units:
+  distance: "km"  # km or mi (affects which is shown first in summary)
+  elevation: "m"  # m or ft
+  speed: "pace"   # pace or speed (for run/walk activities)
+
+# Media settings
+media:
+  download_photos: true   # Primary photo only (API limitation)
+  generate_maps: false    # Future feature
+
+# Sync settings
+sync:
+  default_days: 30
+  skip_existing: true
+```
+
+### 8.2 Environment Variables
+Alternative credential storage:
+```bash
+STRAVA_CLIENT_ID=your_client_id
+STRAVA_CLIENT_SECRET=your_client_secret
+```
+
+### 8.3 CLI Arguments
 
 ```
-strava-to-obsidian [OPTIONS] [COMMAND]
+strava-to-obsidian [OPTIONS] COMMAND [ARGS]
 
 Commands:
-  auth          Authenticate with Strava
-  export        Export activities
-  sync          Sync new activities (incremental)
-  update        Update existing activities
-  status        Show export status
+  auth        Authenticate with Strava (OAuth flow)
+  export      Export activities to Markdown
+  sync        Incremental sync (export new activities only)
 
-Options:
-  --config, -c PATH       Configuration file path
-  --output, -o PATH       Output directory
-  --verbose, -v           Enable verbose logging
-  --quiet, -q             Suppress non-essential output
-  --dry-run               Show what would be done without making changes
-  --force                 Force re-export of all activities
-  --after DATE            Only export activities after date (YYYY-MM-DD)
-  --before DATE           Only export activities before date (YYYY-MM-DD)
-  --type TYPE             Only export specific activity type(s)
-  --limit N               Limit number of activities to export
-  --no-media              Skip media download
-  --no-maps               Skip map generation
-  --help, -h              Show help message
-  --version               Show version
-```
+Export/Sync Options:
+  --output, -o PATH       Output directory (default: ./activities)
+  --days, -d INT          Export last N days (default: 30)
+  --after DATE            Export activities after this date (YYYY-MM-DD)
+  --before DATE           Export activities before this date (YYYY-MM-DD)
+  --force, -f             Overwrite existing files
+  --no-media              Skip media downloads
+  --dry-run               Show what would be exported without writing files
+  --verbose, -v           Verbose output
+  --quiet, -q             Minimal output
 
-### 8.3 Environment Variables
-
-The script SHALL support configuration via environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `STRAVA_CLIENT_ID` | Strava API client ID |
-| `STRAVA_CLIENT_SECRET` | Strava API client secret |
-| `STRAVA_ACCESS_TOKEN` | Current access token |
-| `STRAVA_REFRESH_TOKEN` | Refresh token |
-| `STRAVA_EXPORT_OUTPUT` | Output directory path |
-| `MAPBOX_ACCESS_TOKEN` | Mapbox API token |
-| `GOOGLE_MAPS_API_KEY` | Google Maps API key |
-
----
-
-## 9. Error Handling and Logging
-
-### 9.1 Error Categories
-
-#### 9.1.1 Authentication Errors
-
-| Error | Handling |
-|-------|----------|
-| Invalid credentials | Prompt user to re-authenticate |
-| Expired token | Automatic refresh using refresh token |
-| Refresh token expired | Prompt for full re-authentication |
-| Invalid scope | Request required permissions |
-
-#### 9.1.2 API Errors
-
-| Error | Handling |
-|-------|----------|
-| 400 Bad Request | Log error, skip activity, continue |
-| 401 Unauthorized | Attempt token refresh, then re-auth |
-| 403 Forbidden | Log error, check permissions |
-| 404 Not Found | Log warning, skip resource |
-| 429 Rate Limited | Exponential backoff, resume later |
-| 500+ Server Error | Retry with backoff, max 3 attempts |
-
-#### 9.1.3 File System Errors
-
-| Error | Handling |
-|-------|----------|
-| Permission denied | Log error, prompt user |
-| Disk full | Log error, stop export |
-| Invalid path | Sanitize path, retry |
-| File exists | Based on config (skip/overwrite) |
-
-#### 9.1.4 Network Errors
-
-| Error | Handling |
-|-------|----------|
-| Connection timeout | Retry with exponential backoff |
-| DNS resolution failure | Log error, check network |
-| SSL/TLS error | Log error, check certificates |
-
-### 9.2 Logging
-
-#### 9.2.1 Log Levels
-
-| Level | Usage |
-|-------|-------|
-| DEBUG | Detailed debugging information |
-| INFO | General operational messages |
-| WARNING | Non-critical issues |
-| ERROR | Errors that prevent specific operations |
-| CRITICAL | Errors that prevent script execution |
-
-#### 9.2.2 Log Format
-
-```
-[TIMESTAMP] [LEVEL] [MODULE] Message
-```
-
-Example:
-```
-[2025-01-15T10:30:00Z] [INFO] [export] Starting export of 523 activities
-[2025-01-15T10:30:01Z] [DEBUG] [api] GET /athlete/activities?page=1&per_page=200
-[2025-01-15T10:30:02Z] [INFO] [export] Exported activity 12345678901: Morning Run
-[2025-01-15T10:30:05Z] [WARNING] [media] Photo download failed for activity 12345678902, retrying...
-[2025-01-15T10:30:10Z] [ERROR] [api] Rate limit exceeded, waiting 900 seconds
-```
-
-#### 9.2.3 Log Output
-
-- Console output (configurable verbosity)
-- Log file: `<output_directory>/.strava-export/export.log`
-- Support log rotation (keep last 5 log files, max 10MB each)
-
-### 9.3 Progress Reporting
-
-The script SHALL provide progress feedback:
-
-```
-Strava to Obsidian Export
-=========================
-
-Authenticating... ✓
-Fetching activity list... 523 activities found
-
-Exporting activities:
-[████████████████████░░░░░░░░░░░░░░░░░] 230/523 (44%)
-Current: Morning Run (2024-01-15)
-Downloading media: map ✓ photos (2/3)
-
-Rate limit: 45/100 requests (15 min) | 234/1000 (daily)
-ETA: 15 minutes
+Examples:
+  strava-to-obsidian auth
+  strava-to-obsidian export --days 30
+  strava-to-obsidian export --after 2024-01-01 --before 2024-12-31
+  strava-to-obsidian sync
+  strava-to-obsidian sync --force
 ```
 
 ---
 
-## 10. Security Requirements
+## 9. Error Handling
 
-### 10.1 Token Security
+### 9.1 Network Errors
+- Retry transient failures (5xx, timeouts) with exponential backoff
+- Max 3 retries per request
+- Log failed activity IDs for manual retry
 
-#### 10.1.1 Token Storage
+### 9.2 API Errors
+| Error | Handling |
+|-------|----------|
+| 401 Unauthorized | Attempt token refresh; if fails, prompt re-auth |
+| 403 Forbidden | Log warning, skip activity (likely permission issue) |
+| 404 Not Found | Log warning, skip (deleted activity) |
+| 429 Rate Limited | Wait per `Retry-After` header, then continue |
 
-- Store tokens in configuration file with restricted permissions (600)
-- Do NOT log access tokens
-- Support encryption for stored credentials (optional)
+### 9.3 Data Errors
+- Missing required fields: Use sensible defaults or skip with warning
+- Invalid coordinates: Omit from frontmatter
+- Photo download failure: Log error, continue without photo
 
-#### 10.1.2 Token Handling
-
-- Transmit tokens only over HTTPS
-- Clear tokens from memory after use
-- Validate token format before use
-
-### 10.2 Input Validation
-
-- Sanitize activity names for file system safety
-- Validate URLs before downloading
-- Verify file paths are within output directory
-
-### 10.3 API Security
-
-- Use HTTPS for all API communications
-- Validate SSL certificates
-- Do not disable certificate verification
-
-### 10.4 Data Privacy
-
-- Support excluding private activities
-- Do not expose personal data in logs
-- Provide option to anonymize location data
+### 9.4 File System Errors
+- Permission denied: Exit with clear error message
+- Disk full: Exit with clear error message
+- Invalid filename characters: Sanitize automatically
 
 ---
 
-## 11. Technical Requirements
+## 10. Security Considerations
+
+### 10.1 Credential Storage
+- Never commit credentials to version control
+- Store tokens in user-only readable file (chmod 600)
+- Support environment variables for CI/automation
+- Document `.gitignore` requirements
+
+### 10.2 API Credentials
+- Client secret should never be logged
+- Token refresh happens automatically; user shouldn't see tokens
+
+### 10.3 Data Privacy
+- GPS coordinates may reveal home location
+- Option to redact start coordinates within configurable radius (future)
+- Private activities exported by default (with proper scope)
+
+---
+
+## 11. Development Requirements
 
 ### 11.1 Python Version
-
-- **Minimum:** Python 3.9
-- **Recommended:** Python 3.11+
+- Minimum: Python 3.9
+- Target: Python 3.11+
 
 ### 11.2 Dependencies
+| Package | Purpose |
+|---------|---------|
+| `requests` | HTTP client for API calls |
+| `click` | CLI framework |
+| `pyyaml` | YAML config file parsing |
+| `python-dateutil` | Date parsing and formatting |
+| `python-slugify` | Filename slugification |
 
-#### 11.2.1 Required Dependencies
+### 11.3 Development Dependencies
+| Package | Purpose |
+|---------|---------|
+| `pytest` | Testing framework |
+| `pytest-cov` | Coverage reporting |
+| `black` | Code formatting |
+| `ruff` | Linting |
+| `mypy` | Type checking |
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `requests` | >=2.28.0 | HTTP client for API calls |
-| `python-dateutil` | >=2.8.0 | Date/time parsing |
-| `pyyaml` | >=6.0 | YAML frontmatter handling |
-| `polyline` | >=2.0.0 | Polyline encoding/decoding |
-
-#### 11.2.2 Optional Dependencies
-
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `folium` | >=0.14.0 | Local map generation (OSM) |
-| `selenium` | >=4.0.0 | Map image export (with Folium) |
-| `pillow` | >=9.0.0 | Image processing |
-| `tqdm` | >=4.64.0 | Progress bars |
-| `rich` | >=12.0.0 | Enhanced terminal output |
-
-### 11.3 System Requirements
-
-- **OS:** Windows 10+, macOS 10.15+, Linux (Ubuntu 20.04+)
-- **Disk Space:** Varies by activity count and media
-- **Memory:** Minimum 512MB RAM
-- **Network:** Internet connection required for export
-
-### 11.4 Installation
-
-The script SHALL be installable via pip:
-
-```bash
-pip install strava-to-obsidian
+### 11.4 Project Structure
 ```
-
-Or from source:
-
-```bash
-git clone https://github.com/user/strava-to-obsidian.git
-cd strava-to-obsidian
-pip install -e .
+strava-to-obsidian/
+├── src/
+│   └── strava_to_obsidian/
+│       ├── __init__.py
+│       ├── __main__.py
+│       ├── cli.py           # CLI entry point
+│       ├── auth.py          # OAuth handling
+│       ├── api.py           # Strava API client
+│       ├── models.py        # Activity data models
+│       ├── exporter.py      # Markdown generation
+│       ├── media.py         # Photo/video downloads
+│       └── config.py        # Configuration management
+├── tests/
+│   ├── conftest.py
+│   ├── test_api.py
+│   ├── test_exporter.py
+│   └── fixtures/
+├── pyproject.toml
+├── README.md
+├── REQUIREMENTS.md
+└── .gitignore
 ```
 
 ---
 
-## 12. Non-Functional Requirements
+## 12. Future Enhancements (Post-MVP)
 
-### 12.1 Performance
-
-- Process minimum 10 activities per minute (excluding media download)
-- Support concurrent media downloads (configurable, default 3)
-- Minimize API calls by using batch endpoints where available
-
-### 12.2 Reliability
-
-- Graceful handling of interruptions (Ctrl+C, network failure)
-- Resumable exports from last successful point
-- Data integrity validation after export
-
-### 12.3 Usability
-
-- Clear, informative error messages
-- Progress indication for long operations
-- Comprehensive help documentation
-- Example configuration files
-
-### 12.4 Maintainability
-
-- Modular code architecture
-- Comprehensive docstrings and comments
-- Unit tests for core functionality
-- Integration tests for API interactions
-
-### 12.5 Compatibility
-
-- Output files compatible with Obsidian 1.0+
-- Markdown files viewable in any Markdown editor
-- Cross-platform file paths
+- [ ] Map image generation from GPS polylines (using `summary_polyline`)
+- [ ] Segment effort details
+- [ ] Gear tracking (which shoes/bike used)
+- [ ] Training load / fitness metrics
+- [ ] Bulk historical export with progress bar and resume capability
+- [ ] Home location privacy zone (redact start coordinates within radius)
+- [ ] Custom Markdown templates
+- [ ] Multiple output format support (JSON, CSV)
+- [ ] Obsidian plugin for direct sync
+- [ ] Heart rate zone breakdown (via `GET /activities/{id}/zones`)
+- [ ] Activity comments export
 
 ---
 
-## 13. Appendix
+## Appendix A: Strava Sport Types Reference
 
-### 13.1 Strava Activity Types
+Complete list of Strava sport types for icon mapping:
 
-| API Value | Display Name |
-|-----------|--------------|
-| `Run` | Run |
-| `Ride` | Ride |
-| `Swim` | Swim |
-| `Walk` | Walk |
-| `Hike` | Hike |
-| `AlpineSki` | Alpine Ski |
-| `BackcountrySki` | Backcountry Ski |
-| `Canoeing` | Canoeing |
-| `Crossfit` | Crossfit |
-| `EBikeRide` | E-Bike Ride |
-| `Elliptical` | Elliptical |
-| `Golf` | Golf |
-| `GravelRide` | Gravel Ride |
-| `Handcycle` | Handcycle |
-| `HighIntensityIntervalTraining` | HIIT |
-| `IceSkate` | Ice Skate |
-| `InlineSkate` | Inline Skate |
-| `Kayaking` | Kayaking |
-| `Kitesurf` | Kitesurf |
-| `MountainBikeRide` | Mountain Bike |
-| `NordicSki` | Nordic Ski |
-| `Pilates` | Pilates |
-| `RockClimbing` | Rock Climbing |
-| `RollerSki` | Roller Ski |
-| `Rowing` | Rowing |
-| `Sail` | Sail |
-| `Skateboard` | Skateboard |
-| `Snowboard` | Snowboard |
-| `Snowshoe` | Snowshoe |
-| `Soccer` | Soccer |
-| `StairStepper` | Stair Stepper |
-| `StandUpPaddling` | Stand Up Paddling |
-| `Surfing` | Surfing |
-| `TableTennis` | Table Tennis |
-| `Tennis` | Tennis |
-| `TrailRun` | Trail Run |
-| `Velomobile` | Velomobile |
-| `VirtualRide` | Virtual Ride |
-| `VirtualRow` | Virtual Row |
-| `VirtualRun` | Virtual Run |
-| `WeightTraining` | Weight Training |
-| `Wheelchair` | Wheelchair |
-| `Windsurf` | Windsurf |
-| `Workout` | Workout |
-| `Yoga` | Yoga |
+```
+AlpineSki, BackcountrySki, Badminton, Canoeing, Crossfit, EBikeRide, Elliptical,
+EMountainBikeRide, Golf, GravelRide, Handcycle, HighIntensityIntervalTraining,
+Hike, IceSkate, InlineSkate, Kayaking, Kitesurf, MountainBikeRide, NordicSki,
+Pickleball, Pilates, Racquetball, Ride, RockClimbing, RollerSki, Rowing, Run,
+Sail, Skateboard, Snowboard, Snowshoe, Soccer, Squash, StairStepper,
+StandUpPaddling, Surfing, Swim, TableTennis, Tennis, TrailRun, Velomobile,
+VirtualRide, VirtualRow, VirtualRun, Walk, WeightTraining, Wheelchair,
+Windsurf, Workout, Yoga
+```
 
-### 13.2 Sample Configuration File
+---
 
+## Appendix B: Sample API Responses
+
+### Activity Summary (List endpoint)
 ```json
 {
-  "strava": {
-    "client_id": "YOUR_CLIENT_ID",
-    "client_secret": "YOUR_CLIENT_SECRET"
-  },
-  "output": {
-    "base_directory": "/Users/athlete/ObsidianVault/Fitness",
-    "activities_folder": "activities",
-    "media_folder": "media",
-    "organize_by_year": true,
-    "organize_by_month": true
-  },
-  "export": {
-    "include_private": true,
-    "include_manual": true,
-    "activity_types": [],
-    "include_raw_data": false
-  },
-  "media": {
-    "download_photos": true,
-    "download_videos": false,
-    "generate_maps": true,
-    "map_provider": "osm",
-    "map_width": 800,
-    "map_height": 600,
-    "photo_size": "large"
-  },
-  "formatting": {
-    "units": "both",
-    "date_format": "%Y-%m-%d",
-    "time_format": "%H:%M",
-    "include_tags": true,
-    "custom_tags": ["strava", "fitness"]
-  },
-  "sync": {
-    "mode": "incremental",
-    "update_existing": false,
-    "delete_removed": false
-  }
+  "id": 12345678901,
+  "name": "Morning Run",
+  "distance": 5000.0,
+  "moving_time": 1800,
+  "elapsed_time": 1845,
+  "total_elevation_gain": 45.0,
+  "sport_type": "Run",
+  "start_date": "2025-11-29T15:30:00Z",
+  "start_date_local": "2025-11-29T07:30:00Z",
+  "start_latlng": [47.6062, -122.3321],
+  "average_speed": 2.78,
+  "max_speed": 3.5
 }
 ```
 
-### 13.3 Example Workflow
-
-1. **Initial Setup**
-   ```bash
-   pip install strava-to-obsidian
-   strava-to-obsidian auth
-   ```
-
-2. **Configure**
-   ```bash
-   # Edit configuration file
-   nano ~/.config/strava-to-obsidian/config.json
-   ```
-
-3. **Full Export**
-   ```bash
-   strava-to-obsidian export --output ~/ObsidianVault/Fitness
-   ```
-
-4. **Incremental Sync**
-   ```bash
-   strava-to-obsidian sync
-   ```
-
-5. **Status Check**
-   ```bash
-   strava-to-obsidian status
-   ```
-
-### 13.4 Obsidian Integration Tips
-
-1. **Linking Activities**
-   - Use `[[2024-01-15_Morning_Run]]` to link to activities
-   - Create daily notes that reference activities
-
-2. **Tagging**
-   - Use the `tags` frontmatter for Obsidian tag searches
-   - Filter activities by type, year, or custom tags
-
-3. **Dataview Queries**
-   ```dataview
-   TABLE distance_km as "Distance", duration_formatted as "Duration", avg_heartrate as "Avg HR"
-   FROM "activities"
-   WHERE type = "Run"
-   SORT date DESC
-   LIMIT 10
-   ```
-
-4. **Graph View**
-   - Activities link to gear notes
-   - Activities can link to location/route notes
-   - Build a connected fitness knowledge base
-
----
-
-## Document History
-
-| Version | Date | Author | Changes |
-|---------|------|--------|---------|
-| 1.0 | November 2025 | - | Initial document |
-
----
-
-*This requirements document is subject to updates as the project evolves.*
+### Activity Detail (Individual endpoint)
+Includes additional fields:
+```json
+{
+  "description": "Easy recovery run",
+  "calories": 320.0,
+  "average_heartrate": 145.0,
+  "max_heartrate": 165,
+  "photos": {
+    "count": 2,
+    "primary": { "urls": { "600": "https://..." } }
+  }
+}
+```
