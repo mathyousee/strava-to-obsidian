@@ -77,8 +77,9 @@ def generate_frontmatter(activity: Activity) -> str:
     # Location (if available)
     if activity.start_latlng and len(activity.start_latlng) == 2:
         lines.extend([
-            f"start_lat: {activity.start_latlng[0]:.6f}",
-            f"start_lng: {activity.start_latlng[1]:.6f}",
+            "coordinates:",
+            f"  - {activity.start_latlng[0]:.6f}",
+            f"  - {activity.start_latlng[1]:.6f}",
         ])
 
     # Photo (if available)
