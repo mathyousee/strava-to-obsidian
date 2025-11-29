@@ -109,7 +109,7 @@ activities/
 ```
 
 ## Features
- 
+
 - ✅ OAuth 2.0 authentication with automatic token refresh
 - ✅ Activity metrics: distance, duration, pace, heart rate, elevation, calories
 - ✅ Sport-specific icons (🏃 🚴 🏊 🥾 and 30+ more)
