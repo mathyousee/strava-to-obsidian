@@ -214,7 +214,7 @@ class Activity:
         """Generate a filename for this activity."""
         date_str = self.start_date_local.strftime("%Y-%m-%d")
         name_slug = slugify(self.name, max_length=50)
-        return f"{date_str}-{name_slug}.md"
+        return f"{date_str}-{name_slug}-{self.id}.md"
 
     def is_run_or_walk(self) -> bool:
         """Check if this is a running or walking activity (for pace display)."""
