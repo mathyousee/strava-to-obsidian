@@ -74,6 +74,71 @@ def format_pace(seconds_per_km: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+def format_pace_per_mi(speed_ms: float) -> str:
+    """Format pace as M:SS per mile from m/s speed."""
+    if speed_ms <= 0:
+        return "—"
+    # Convert m/s to seconds per mile
+    seconds_per_mile = 1609.344 / speed_ms
+    minutes = int(seconds_per_mile // 60)
+    secs = int(seconds_per_mile % 60)
+    return f"{minutes}:{secs:02d}"
+
+
+def meters_to_miles(meters: float) -> float:
+    """Convert meters to miles."""
+    return meters / 1609.344
+
+
+def meters_to_feet(meters: float) -> float:
+    """Convert meters to feet."""
+    return meters * 3.28084
+
+
+@dataclass
+class Lap:
+    """Represents a single lap from a Strava activity."""
+
+    lap_index: int
+    distance: float  # meters
+    elapsed_time: int  # seconds
+    average_speed: float  # m/s
+    average_heartrate: Optional[float] = None
+    total_elevation_gain: float = 0.0  # meters
+
+    @classmethod
+    def from_api_response(cls, data: dict[str, Any]) -> "Lap":
+        """Create Lap from Strava API lap object."""
+        return cls(
+            lap_index=data.get("lap_index", 1),
+            distance=data.get("distance", 0.0),
+            elapsed_time=data.get("elapsed_time", 0),
+            average_speed=data.get("average_speed", 0.0),
+            average_heartrate=data.get("average_heartrate"),
+            total_elevation_gain=data.get("total_elevation_gain", 0.0),
+        )
+
+    @property
+    def distance_mi(self) -> float:
+        """Distance in miles."""
+        return meters_to_miles(self.distance)
+
+    @property
+    def elapsed_time_fmt(self) -> str:
+        """Formatted elapsed time."""
+        return format_duration(self.elapsed_time)
+
+    @property
+    def pace_per_mi(self) -> str:
+        """Pace as M:SS per mile."""
+        return format_pace_per_mi(self.average_speed)
+
+    @property
+    def elevation_gain_ft(self) -> float:
+        """Elevation gain in feet."""
+        return meters_to_feet(self.total_elevation_gain)
+
+
 @dataclass
 class Activity:
     """Represents a Strava activity with all relevant data."""
@@ -110,6 +175,9 @@ class Activity:
     # Photo (primary only - API limitation)
     photo_url: Optional[str] = None
 
+    # Laps
+    laps: list["Lap"] = field(default_factory=list)
+
     # Raw data for reference
     raw_data: dict[str, Any] = field(default_factory=dict)
 
@@ -131,6 +199,10 @@ class Activity:
             # Prefer larger sizes
             photo_url = urls.get("600") or urls.get("100")
 
+        # Parse laps if available
+        laps_data = data.get("laps", [])
+        laps = [Lap.from_api_response(lap) for lap in laps_data]
+
         return cls(
             id=data["id"],
             name=data.get("name", "Untitled Activity"),
@@ -148,6 +220,7 @@ class Activity:
             calories=data.get("calories"),
             start_latlng=data.get("start_latlng"),
             photo_url=photo_url,
+            laps=laps,
             raw_data=data,
         )
 

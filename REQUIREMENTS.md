@@ -1,8 +1,9 @@
 # Software Requirements Document
 ## Strava to Obsidian Activity Exporter
 
-**Version:** 1.0  
-**Last Updated:** November 2025
+**Version:** 1.1  
+**Last Updated:** November 2025  
+**Implementation Status:** MVP Complete
 
 ---
 
@@ -34,11 +35,16 @@ This document specifies the software requirements for a Python script that expor
 
 The Strava to Obsidian Exporter will:
 - Authenticate with the Strava API using OAuth 2.0
-- Retrieve all user activities from Strava
+- Retrieve user activities from Strava with date range filtering
 - Convert activity data to Obsidian-flavored Markdown files
-- Download and organize associated media (photos, videos, map images)
-- Support incremental updates to avoid re-downloading existing activities
+- Download primary activity photos (API limitation: only primary photo accessible)
+- Support incremental sync to avoid re-downloading existing activities
 - Maintain a local archive that can be used with Obsidian or any Markdown-compatible tool
+
+**Known API Limitations:**
+- Only the primary photo per activity is accessible via API
+- Videos are not available via the Strava API
+- Rate limits: 100 requests/15 min, 1,000 requests/day
 
 ### 1.3 Definitions and Acronyms
 
@@ -57,6 +63,20 @@ The Strava to Obsidian Exporter will:
 - [Strava API Documentation](https://developers.strava.com/docs/reference/)
 - [Strava API Authentication](https://developers.strava.com/docs/authentication/)
 - [Obsidian Markdown Reference](https://help.obsidian.md/Editing+and+formatting/Obsidian+Flavored+Markdown)
+
+### 1.5 Implementation Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| OAuth Authentication | ✅ Complete | Includes manual mode for restricted environments |
+| Activity Export | ✅ Complete | Exports to Markdown with YAML frontmatter |
+| Incremental Sync | ✅ Complete | Only downloads new activities |
+| Primary Photo Download | ✅ Complete | Downloads cover photo per activity |
+| Rate Limiting | ✅ Complete | Respects 100/15min, 1000/day limits |
+| Static Map Generation | ⏳ Planned | Requires Mapbox or similar API |
+| Lap Data | ⏳ Planned | Table with distance, time, pace, HR, elevation |
+| Segment Efforts | ⏳ Planned | Available in API, not yet exported |
+| Gear Tracking | ⏳ Planned | Available in API, not yet exported |
 
 ---
 
@@ -233,15 +253,17 @@ The script SHALL extract and store the following activity data:
 
 #### 4.1.6 Lap Data
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `laps` | Array | Array of lap objects |
-| `lap.name` | String | Lap name |
-| `lap.elapsed_time` | Integer | Lap elapsed time |
-| `lap.moving_time` | Integer | Lap moving time |
-| `lap.distance` | Float | Lap distance |
-| `lap.average_speed` | Float | Lap average speed |
-| `lap.average_heartrate` | Float | Lap average heart rate |
+Lap data is included in the activity detail response. Fields used for export:
+
+| Field | Type | Description | Used In |
+|-------|------|-------------|----------|
+| `laps` | Array | Array of lap objects | - |
+| `lap.lap_index` | Integer | Lap number (1-based) | Lap column |
+| `lap.distance` | Float | Lap distance (meters) | Distance column (converted to mi) |
+| `lap.elapsed_time` | Integer | Lap elapsed time (seconds) | Time column |
+| `lap.average_speed` | Float | Average speed (m/s) | Pace column (converted to min/mi) |
+| `lap.average_heartrate` | Float | Lap average heart rate | Avg HR column |
+| `lap.total_elevation_gain` | Float | Elevation gain (meters) | Elev column (converted to ft) |
 
 ### 4.2 Athlete Data
 
@@ -259,34 +281,22 @@ The script SHALL extract and store the following activity data:
 
 ### 5.1 Directory Structure
 
-The script SHALL create the following directory structure:
+The script creates the following directory structure:
 
 ```
-<output_directory>/
-├── .strava-export/
-│   ├── config.json          # Configuration and tokens
-│   ├── state.json            # Export state and last sync
-│   └── activity_index.json   # Index of exported activities
-├── media/
-│   ├── maps/
-│   │   └── <activity_id>_map.png
-│   ├── photos/
-│   │   └── <activity_id>/
-│   │       ├── photo_001.jpg
-│   │       └── photo_002.jpg
-│   └── videos/
-│       └── <activity_id>/
-│           └── video_001.mp4
-└── activities/
-    ├── 2024/
-    │   ├── 2024-01/
-    │   │   ├── 2024-01-15_Morning_Run.md
-    │   │   └── 2024-01-16_Evening_Ride.md
-    │   └── 2024-02/
-    │       └── 2024-02-01_Long_Run.md
-    └── 2025/
-        └── 2025-01/
-            └── 2025-01-05_New_Year_Ride.md
+<output_directory>/               # e.g., ./activities
+├── 2025-11-15-morning-run-16468414097.md
+├── 2025-11-16-evening-ride-16478523456.md
+├── ...
+└── media/
+    ├── 16468414097_photo.jpg     # Primary photo per activity
+    ├── 16478523456_photo.jpg
+    └── ...
+```
+
+**Token Storage (separate location):**
+```
+.strava_tokens.json              # OAuth tokens (chmod 600)
 ```
 
 ### 5.2 File Naming Conventions
@@ -295,30 +305,32 @@ The script SHALL create the following directory structure:
 
 Activity Markdown files SHALL be named using the pattern:
 ```
-YYYY-MM-DD_<sanitized_activity_name>.md
+YYYY-MM-DD-<slugified-activity-name>-<strava_id>.md
 ```
 
-Sanitization rules:
-- Replace spaces with underscores
-- Remove or replace special characters: `/ \ : * ? " < > |`
-- Truncate to maximum 100 characters (before extension)
-- Append numeric suffix if duplicate: `_2`, `_3`, etc.
+**Examples:**
+- `2025-11-15-taco-trot-25k-16468414097.md`
+- `2025-11-28-morning-run-16593713184.md`
+
+Slugification rules:
+- Convert to lowercase
+- Replace spaces with hyphens
+- Remove special characters (keep alphanumeric and hyphens)
+- Truncate name to 50 characters max
+- Always append Strava activity ID for uniqueness
 
 #### 5.2.2 Media Files
 
-**Map Images:**
-```
-<activity_id>_map.png
-```
-
 **Photos:**
 ```
-<activity_id>/<sequential_number>_<original_filename>
+<activity_id>_photo.jpg
 ```
 
-**Videos:**
+**Note:** Due to Strava API limitations, only the primary (cover) photo is accessible per activity.
+
+**Map Images (Future):**
 ```
-<activity_id>/<sequential_number>_<original_filename>
+<activity_id>_map.png
 ```
 
 ### 5.3 Index and State Files
@@ -363,195 +375,118 @@ Sanitization rules:
 
 ### 6.1 Frontmatter Structure
 
-Each activity Markdown file SHALL include YAML frontmatter with the following structure:
+Each activity Markdown file includes YAML frontmatter with activity metadata. The current MVP implementation uses this structure:
 
 ```yaml
 ---
 # Core Identification
-strava_id: 12345678901
+id: 12345678901
 strava_url: "https://www.strava.com/activities/12345678901"
-title: "Morning Run"
+name: "Morning Run"
 date: 2024-01-15
-datetime: 2024-01-15T07:30:00-05:00
-timezone: "America/New_York"
+start_date_local: "2024-01-15T07:30:00"
 
 # Activity Classification
-type: Run
 sport_type: Run
-activity_type: run
-is_race: false
-is_commute: false
-is_trainer: false
-is_manual: false
-is_private: false
+icon: 🏃
 
 # Performance Metrics
-distance_km: 10.5
-distance_mi: 6.52
-duration_minutes: 52
-duration_formatted: "52:30"
-moving_time_minutes: 50
-moving_time_formatted: "50:15"
-pace_per_km: "5:00"
-pace_per_mi: "8:03"
-speed_kmh: 12.0
-speed_mph: 7.46
-elevation_gain_m: 125
-elevation_gain_ft: 410
+elapsed_time: 3150
+moving_time: 3015
+distance: 10500.0
+total_elevation_gain: 125.0
+average_speed: 3.48
+max_speed: 4.52
 calories: 650
 
 # Heart Rate (if available)
-avg_heartrate: 152
+average_heartrate: 152
 max_heartrate: 175
 
-# Power Data (if available)
-avg_watts: null
-max_watts: null
-weighted_avg_watts: null
+# Location (as YAML array)
+coordinates:
+  - 40.7128
+  - -74.0060
 
-# Cadence (if available)
-avg_cadence: 180
-
-# Location
-start_location: [40.7128, -74.0060]
-end_location: [40.7580, -73.9855]
-city: "New York"
-state: "New York"
-country: "United States"
-
-# Gear
-gear: "Nike Pegasus 40"
-gear_id: "g12345678"
-
-# Social
-kudos: 15
-comments: 3
-achievements: 2
-pr_count: 1
-
-# Strava Scores
-suffer_score: 85
-relative_effort: 85
-
-# Media
-has_photos: true
-photo_count: 2
-has_map: true
+# Media (primary photo only, if available)
+photo: "[[media/12345678901_photo.jpg]]"
 
 # Tags for Obsidian
 tags:
   - strava
   - run
-  - morning-run
-  - 2024
-  - january
-
-# Aliases for Obsidian linking
-aliases:
-  - "Morning Run 2024-01-15"
-  - "Run 10.5km"
-
-# Custom fields
-weather: null
-notes: null
 ---
 ```
 
+**Notes on Implementation:**
+- `coordinates` is stored as a YAML array `[lat, lng]` for Obsidian Leaflet compatibility
+- `photo` uses Obsidian wikilink syntax for embedding
+- Times are stored in seconds (raw API values) for easy processing
+- Only fields with values are included (nulls are omitted)
+
 ### 6.2 Markdown Body Structure
 
-The body of each activity file SHALL follow this template:
+The body of each activity file follows this template:
 
 ```markdown
 # Morning Run
 
-> 🏃 **Run** on **Monday, January 15, 2024** at **7:30 AM**
-
-## Summary
-
-| Metric | Value |
-|--------|-------|
-| 📏 Distance | 10.5 km (6.52 mi) |
-| ⏱️ Duration | 52:30 |
-| 🏃 Moving Time | 50:15 |
-| ⚡ Pace | 5:00 /km (8:03 /mi) |
-| ⛰️ Elevation | +125 m (+410 ft) |
-| 🔥 Calories | 650 kcal |
-| ❤️ Avg HR | 152 bpm |
-| 💪 Relative Effort | 85 |
+**Run** · Mon, Jan 15, 2024 · 6.52 mi in 52:30
 
 ## Description
 
 User's activity description appears here if provided.
 
-## Route Map
+## Photo
 
-![[media/maps/12345678901_map.png]]
-
-## Photos
-
-![[media/photos/12345678901/001_photo.jpg]]
-![[media/photos/12345678901/002_photo.jpg]]
+![[media/12345678901_photo.jpg]]
 
 ## Laps
 
-| Lap | Distance | Time | Pace | Avg HR |
-|-----|----------|------|------|--------|
-| 1 | 1.0 km | 5:05 | 5:05 /km | 145 |
-| 2 | 1.0 km | 4:58 | 4:58 /km | 150 |
-| 3 | 1.0 km | 4:55 | 4:55 /km | 154 |
-| ... | ... | ... | ... | ... |
-
-## Segments
-
-### Segment Name 1
-- **Time:** 2:45
-- **Rank:** 15 / 1,234 (Top 1.2%)
-- **PR:** Yes ⭐
-
-### Segment Name 2
-- **Time:** 1:30
-- **Rank:** 234 / 5,678
-
-## Best Efforts
-
-| Effort | Time | Date |
-|--------|------|------|
-| 1 km | 4:32 | PR! |
-| 1 mile | 7:25 | - |
-| 5 km | 24:15 | - |
-
-## Achievements
-
-- 🏆 New 1 km PR: 4:32
-- 🥈 2nd fastest 5 km this year
-
-## Gear
-
-**Nike Pegasus 40** (Total: 523.4 km)
-
-## Raw Data
-
-<details>
-<summary>View raw Strava data</summary>
-
-```json
-{
-  "id": 12345678901,
-  "name": "Morning Run",
-  ...
-}
+| Lap | Distance | Time | Pace | Avg HR | Elev |
+|-----|----------|------|------|--------|------|
+| 1 | 1.00 mi | 8:05 | 8:05/mi | 145 | +42 ft |
+| 2 | 1.00 mi | 7:58 | 7:58/mi | 150 | +38 ft |
+| 3 | 1.00 mi | 7:52 | 7:52/mi | 154 | +25 ft |
+| 4 | 1.00 mi | 8:10 | 8:10/mi | 152 | +18 ft |
+| 5 | 1.00 mi | 7:45 | 7:45/mi | 158 | +12 ft |
+| 6 | 1.00 mi | 7:40 | 7:40/mi | 162 | +15 ft |
+| 7 | 0.52 mi | 4:00 | 7:41/mi | 165 | +10 ft |
 ```
 
-</details>
+**Notes:**
+- Lap table only included for activities with lap data
+- Distance displayed in miles
+- Pace calculated as time / distance
+- Avg HR omitted if heart rate data unavailable
+- Elevation shown as gain per lap (+ prefix)
 
----
+### 6.3 Future Enhancements
 
-*Exported from Strava on 2025-01-15 | [View on Strava](https://www.strava.com/activities/12345678901)*
+The following sections may be added in future versions:
+
+#### Segments (Planned)
+```markdown
+## Segments
+
+### Segment Name
+- **Time:** 2:45
+- **Rank:** 15 / 1,234
+```
+
+#### Best Efforts (Planned)
+```markdown
+## Best Efforts
+
+| Effort | Time |
+|--------|------|
+| 1 mile | 7:25 |
+| 5K | 24:15 |
 ```
 
 ### 6.3 Activity Type Icons
 
-The script SHALL use appropriate icons for different activity types:
+The script uses appropriate icons for different activity types:
 
 | Activity Type | Icon |
 |---------------|------|
@@ -597,105 +532,46 @@ The script SHALL support both metric and imperial units:
 
 ## 7. Media Handling
 
-### 7.1 Map Generation
+### 7.1 API Limitations (Important)
 
-#### 7.1.1 Map Image Requirements
+**The Strava API has significant limitations for media access:**
 
-The script SHALL generate static map images for activities with GPS data:
+| Media Type | API Support | Implementation |
+|------------|-------------|----------------|
+| Primary Photo | ✅ Available | Downloaded via activity detail endpoint |
+| Additional Photos | ❌ No API access | Not implemented |
+| Videos | ❌ No API access | Not implemented |
+| Route Polyline | ✅ Available | Stored in activity data |
+| Static Maps | ⚠️ Requires external API | Future enhancement |
 
-- **Image Format:** PNG
-- **Resolution:** 800 x 600 pixels (configurable)
-- **Style:** Clean, readable with route overlay
-- **Route Color:** Activity type-specific (configurable)
-- **Background:** Street map or satellite (configurable)
+### 7.2 Photo Handling (Current Implementation)
 
-#### 7.1.2 Map Generation Options
+The script downloads the **primary photo only** for each activity:
+
+1. **Source:** `activity.photos.primary.urls` from activity detail endpoint
+2. **Size Selection:** Largest available (typically 600px)
+3. **Storage:** `media/<activity_id>_photo.jpg`
+4. **Embedding:** Obsidian wikilink format `![[media/<id>_photo.jpg]]`
+
+**Code Flow:**
+```python
+# From activity detail response
+if activity.get("photos", {}).get("primary"):
+    photo_url = activity["photos"]["primary"]["urls"].get("600")
+    # Download and save to media folder
+```
+
+### 7.3 Map Generation (Future Enhancement)
+
+Map generation is planned but not yet implemented. Options include:
 
 **Option 1: Mapbox Static Images API**
-```
-https://api.mapbox.com/styles/v1/mapbox/streets-v11/static/
-  path-{strokeWidth}+{strokeColor}({encodedPolyline})/
-  auto/{width}x{height}?access_token={token}
-```
+- Requires Mapbox access token
+- Uses encoded polyline from activity
 
-**Option 2: OpenStreetMap with Folium**
-- Generate maps locally using Python Folium library
-- Export as PNG using browser automation
-
-**Option 3: Google Static Maps API**
-```
-https://maps.googleapis.com/maps/api/staticmap?
-  size={width}x{height}&
-  path=enc:{encodedPolyline}&
-  key={api_key}
-```
-
-#### 7.1.3 Polyline Decoding
-
-The script SHALL:
-- Decode Strava's encoded polyline format
-- Support both summary and detailed polylines
-- Handle activities without GPS data gracefully
-
-### 7.2 Photo Handling
-
-#### 7.2.1 Photo Download
-
-The script SHALL download activity photos:
-- Download full-resolution photos when available
-- Fall back to largest available size
-- Preserve original file format (JPEG, PNG)
-- Include photo metadata (EXIF) when available
-
-#### 7.2.2 Photo Sources
-
-| Source | Access | Notes |
-|--------|--------|-------|
-| Primary photos | API `/activities/{id}/photos` | Direct Strava photos |
-| Instagram photos | May be linked | Requires additional handling |
-
-#### 7.2.3 Photo Metadata
-
-Store photo metadata for each image:
-```json
-{
-  "photo_id": "12345",
-  "activity_id": 12345678901,
-  "caption": "Beautiful sunrise",
-  "location": [40.7128, -74.0060],
-  "taken_at": "2024-01-15T07:45:00Z",
-  "urls": {
-    "100": "https://...",
-    "600": "https://...",
-    "2048": "https://..."
-  },
-  "local_path": "media/photos/12345678901/001_sunrise.jpg"
-}
-```
-
-### 7.3 Video Handling
-
-#### 7.3.1 Video Download
-
-The script SHALL attempt to download activity videos:
-- Check for video attachments in activity
-- Download highest quality available
-- Store in activity-specific subfolder
-
-#### 7.3.2 Video Limitations
-
-Note: Strava's API has limited video support. The script SHALL:
-- Document known limitations
-- Handle missing video gracefully
-- Log when videos cannot be downloaded
-
-### 7.4 Media Storage Optimization
-
-#### 7.4.1 Deduplication
-
-- Check if media file already exists before downloading
-- Use file hash (MD5/SHA256) for duplicate detection
-- Skip download if identical file exists
+**Option 2: Leaflet in Obsidian**
+- Use Obsidian Leaflet plugin with stored coordinates
+- No additional API required
 
 #### 7.4.2 Progressive Download
 
@@ -941,48 +817,65 @@ Default locations (in order of precedence):
 
 ### 8.2 Command Line Interface
 
-The script SHALL support the following command line arguments:
+The script supports the following commands:
 
 ```
-strava-to-obsidian [OPTIONS] [COMMAND]
+strava-to-obsidian [OPTIONS] COMMAND
 
 Commands:
-  auth          Authenticate with Strava
-  export        Export activities
+  auth          Authenticate with Strava OAuth
+  export        Export activities to Markdown
   sync          Sync new activities (incremental)
-  update        Update existing activities
-  status        Show export status
+  status        Show authentication and export status
 
-Options:
-  --config, -c PATH       Configuration file path
-  --output, -o PATH       Output directory
-  --verbose, -v           Enable verbose logging
-  --quiet, -q             Suppress non-essential output
-  --dry-run               Show what would be done without making changes
-  --force                 Force re-export of all activities
-  --after DATE            Only export activities after date (YYYY-MM-DD)
-  --before DATE           Only export activities before date (YYYY-MM-DD)
-  --type TYPE             Only export specific activity type(s)
-  --limit N               Limit number of activities to export
-  --no-media              Skip media download
-  --no-maps               Skip map generation
-  --help, -h              Show help message
-  --version               Show version
+Auth Options:
+  --manual              Use manual code entry (for environments without localhost)
+
+Export/Sync Options:
+  --output, -o PATH     Output directory (default: ./activities)
+  --days N              Number of days to look back (default: 30)
+
+Global Options:
+  --help, -h            Show help message
+  --version             Show version
+```
+
+**Example Usage:**
+
+```bash
+# Initial authentication (standard)
+strava-to-obsidian auth
+
+# Authentication in restricted environments (codespaces, remote)
+strava-to-obsidian auth --manual
+
+# Export last 30 days
+strava-to-obsidian export --output ./activities
+
+# Export last 90 days
+strava-to-obsidian export --output ./activities --days 90
+
+# Incremental sync (new activities only)
+strava-to-obsidian sync --output ./activities
+
+# Check status
+strava-to-obsidian status
 ```
 
 ### 8.3 Environment Variables
 
-The script SHALL support configuration via environment variables:
+The script reads credentials from a `.env` file (via python-dotenv):
 
-| Variable | Description |
-|----------|-------------|
-| `STRAVA_CLIENT_ID` | Strava API client ID |
-| `STRAVA_CLIENT_SECRET` | Strava API client secret |
-| `STRAVA_ACCESS_TOKEN` | Current access token |
-| `STRAVA_REFRESH_TOKEN` | Refresh token |
-| `STRAVA_EXPORT_OUTPUT` | Output directory path |
-| `MAPBOX_ACCESS_TOKEN` | Mapbox API token |
-| `GOOGLE_MAPS_API_KEY` | Google Maps API key |
+```bash
+# .env file
+STRAVA_CLIENT_ID=your_client_id
+STRAVA_CLIENT_SECRET=your_client_secret
+```
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `STRAVA_CLIENT_ID` | Strava API client ID | Yes |
+| `STRAVA_CLIENT_SECRET` | Strava API client secret | Yes |
 
 ---
 
@@ -1127,46 +1020,45 @@ ETA: 15 minutes
 
 ### 11.2 Dependencies
 
-#### 11.2.1 Required Dependencies
+#### 11.2.1 Required Dependencies (Current Implementation)
 
 | Package | Version | Purpose |
 |---------|---------|---------|
+| `click` | >=8.0.0 | CLI framework |
 | `requests` | >=2.28.0 | HTTP client for API calls |
 | `python-dateutil` | >=2.8.0 | Date/time parsing |
-| `pyyaml` | >=6.0 | YAML frontmatter handling |
-| `polyline` | >=2.0.0 | Polyline encoding/decoding |
+| `python-slugify` | >=8.0.0 | Filename slugification |
+| `python-dotenv` | >=1.0.0 | Environment variable loading |
 
-#### 11.2.2 Optional Dependencies
+#### 11.2.2 Optional/Future Dependencies
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `folium` | >=0.14.0 | Local map generation (OSM) |
-| `selenium` | >=4.0.0 | Map image export (with Folium) |
-| `pillow` | >=9.0.0 | Image processing |
-| `tqdm` | >=4.64.0 | Progress bars |
+| `polyline` | >=2.0.0 | Polyline encoding/decoding (for maps) |
+| `folium` | >=0.14.0 | Local map generation |
 | `rich` | >=12.0.0 | Enhanced terminal output |
 
 ### 11.3 System Requirements
 
 - **OS:** Windows 10+, macOS 10.15+, Linux (Ubuntu 20.04+)
-- **Disk Space:** Varies by activity count and media
-- **Memory:** Minimum 512MB RAM
+- **Disk Space:** ~1KB per activity, plus photos (~100KB each)
+- **Memory:** Minimum 256MB RAM
 - **Network:** Internet connection required for export
 
 ### 11.4 Installation
 
-The script SHALL be installable via pip:
-
-```bash
-pip install strava-to-obsidian
-```
-
-Or from source:
+Install from source:
 
 ```bash
 git clone https://github.com/user/strava-to-obsidian.git
 cd strava-to-obsidian
 pip install -e .
+```
+
+Create `.env` file with Strava credentials:
+```bash
+cp .env.example .env
+# Edit .env with your Client ID and Secret
 ```
 
 ---

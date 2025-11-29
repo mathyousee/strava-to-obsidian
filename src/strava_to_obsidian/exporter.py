@@ -4,7 +4,44 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from strava_to_obsidian.models import Activity, format_pace
+from strava_to_obsidian.models import Activity, Lap, format_pace
+
+
+def generate_laps_table(laps: list[Lap]) -> list[str]:
+    """Generate a Markdown table for lap data."""
+    if not laps:
+        return []
+
+    lines = [
+        "",
+        "## Laps",
+        "",
+        "| Lap | Distance | Time | Pace | Avg HR | Elev |",
+        "|-----|----------|------|------|--------|------|",
+    ]
+
+    for lap in laps:
+        # Format distance
+        distance = f"{lap.distance_mi:.2f} mi"
+
+        # Format time
+        time = lap.elapsed_time_fmt
+
+        # Format pace
+        pace = f"{lap.pace_per_mi}/mi"
+
+        # Format heart rate (or dash if not available)
+        hr = f"{lap.average_heartrate:.0f}" if lap.average_heartrate else "—"
+
+        # Format elevation gain
+        if lap.total_elevation_gain > 0:
+            elev = f"+{lap.elevation_gain_ft:.0f} ft"
+        else:
+            elev = "—"
+
+        lines.append(f"| {lap.lap_index} | {distance} | {time} | {pace} | {hr} | {elev} |")
+
+    return lines
 
 
 def generate_frontmatter(activity: Activity) -> str:
@@ -158,6 +195,9 @@ def generate_body(activity: Activity) -> str:
             "",
             f"![[media/{activity.id}_photo.jpg]]",
         ])
+
+    # Laps
+    lines.extend(generate_laps_table(activity.laps))
 
     # Footer
     lines.extend([

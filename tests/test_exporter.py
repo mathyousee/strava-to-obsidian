@@ -75,7 +75,7 @@ class TestModels:
         )
 
         filename = activity.generate_filename()
-        assert filename == "2025-11-29-morning-run.md"
+        assert filename == "2025-11-29-morning-run-12345678901.md"
 
     def test_activity_filename_special_chars(self):
         """Test filename generation with special characters."""
@@ -87,7 +87,7 @@ class TestModels:
         )
 
         filename = activity.generate_filename()
-        assert filename == "2025-11-29-5k-race.md"
+        assert filename == "2025-11-29-5k-race-12345678901.md"
 
 
 class TestExporter:
