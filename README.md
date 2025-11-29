@@ -4,59 +4,137 @@ Export your Strava activities via the official API and store them as Obsidian-fl
 
 ## Overview
 
-This project provides a Python script that:
+A Python CLI tool that:
 
-- **Exports all Strava activities** using the official Strava API (not HTML scraping)
-- **Creates Obsidian-compatible Markdown files** with rich YAML frontmatter
-- **Downloads media** (photos, videos, map images) into an organized `/media/` folder
+- **Exports Strava activities** using the official Strava API (not scraping)
+- **Creates Obsidian-compatible Markdown files** with YAML frontmatter
+- **Downloads primary activity photo** into an organized `media/` folder
 - **Supports incremental sync** to keep your local archive up-to-date
 
-## Documentation
-
-📋 **[Software Requirements Document](REQUIREMENTS.md)** - Detailed specifications for the exporter including:
-- Strava API integration requirements
-- Data model and activity fields
-- File structure and naming conventions
-- Obsidian Markdown format specification
-- Media handling (photos, videos, maps)
-- Configuration options
-- Error handling and security considerations
-
-## Quick Start
-
-*(Coming soon - implementation in progress)*
+## Installation
 
 ```bash
-# Install
-pip install strava-to-obsidian
+# Clone the repository
+git clone https://github.com/mathyousee/strava-to-obsidian.git
+cd strava-to-obsidian
 
-# Authenticate with Strava
+# Install in development mode
+pip install -e .
+```
+
+## Setup
+
+### 1. Create a Strava API Application
+
+1. Go to [Strava API Settings](https://www.strava.com/settings/api)
+2. Create a new application
+3. Note your **Client ID** and **Client Secret**
+
+### 2. Configure Credentials
+
+**Option A: Using a `.env` file (recommended)**
+
+```bash
+cp .env.example .env
+# Edit .env with your credentials
+```
+
+```env
+STRAVA_CLIENT_ID=your_client_id
+STRAVA_CLIENT_SECRET=your_client_secret
+```
+
+**Option B: Using environment variables**
+
+```bash
+export STRAVA_CLIENT_ID='your_client_id'
+export STRAVA_CLIENT_SECRET='your_client_secret'
+```
+
+### 3. Authenticate
+
+```bash
 strava-to-obsidian auth
+```
 
-# Export all activities
-strava-to-obsidian export --output ~/ObsidianVault/Fitness
+This opens your browser to authorize the app. Tokens are saved locally.
 
-# Sync new activities
+## Usage
+
+```bash
+# Export last 30 days of activities
+strava-to-obsidian export
+
+# Export to a specific directory
+strava-to-obsidian export --output ~/ObsidianVault/activities
+
+# Export last 90 days
+strava-to-obsidian export --days 90
+
+# Export a specific date range
+strava-to-obsidian export --after 2024-01-01 --before 2024-12-31
+
+# Sync new activities (incremental)
 strava-to-obsidian sync
+
+# Check status
+strava-to-obsidian status
+```
+
+### CLI Options
+
+```
+strava-to-obsidian export [OPTIONS]
+
+Options:
+  -o, --output PATH    Output directory (default: ./activities)
+  -d, --days INTEGER   Export last N days (default: 30)
+  --after YYYY-MM-DD   Export activities after this date
+  --before YYYY-MM-DD  Export activities before this date
+  -f, --force          Overwrite existing files
+  --no-media           Skip downloading photos
+  --dry-run            Preview without writing files
+  -v, --verbose        Show detailed output
+```
+
+## Output Structure
+
+```
+activities/
+├── 2025-11-29-morning-run.md
+├── 2025-11-28-evening-ride.md
+└── media/
+    ├── 12345678901_photo.jpg
+    └── ...
 ```
 
 ## Features
 
 - ✅ OAuth 2.0 authentication with automatic token refresh
-- ✅ Full activity data export with all metrics
-- ✅ Map image generation from GPS data
-- ✅ Photo and video downloads
-- ✅ Obsidian-friendly YAML frontmatter
+- ✅ Activity metrics: distance, duration, pace, heart rate, elevation, calories
+- ✅ Sport-specific icons (🏃 🚴 🏊 🥾 and 30+ more)
+- ✅ Primary photo download
+- ✅ Obsidian-friendly YAML frontmatter with both metric and imperial units
 - ✅ Incremental sync support
-- ✅ Rate limit handling
-- ✅ Configurable export options
+- ✅ Rate limit handling with automatic retry
+- ✅ Date range filtering for historical exports
+
+## Known Limitations
+
+Due to Strava API restrictions:
+- Only the **primary photo** per activity is accessible (not all photos)
+- **Videos are not available** via the API
+- Rate limits: 100 requests/15 min, 1,000/day (large historical exports may require multiple runs)
+
+## Documentation
+
+📋 **[Requirements Document](REQUIREMENTS.md)** — Full technical specification
 
 ## Requirements
 
 - Python 3.9+
-- Strava account with API application credentials
-- Internet connection for export
+- Strava account with [API application](https://www.strava.com/settings/api)
 
 ## License
 
-*(License to be determined)*
+MIT
